@@ -12,14 +12,13 @@ from typing import Tuple, Dict, Any
 class CarlaRLEnv(gym.Env):
     """
     Environnement CARLA optimisé pour RL.
-    - Mode synchrone (fixed_delta_seconds)
-    - Callback caméra léger (stocke raw_data)
-    - Conversion image dans _get_observation (centralisé)
+    - Mode synchrone
     - Frame stacking
     - Observation: Dict { image: HxWxC, state: vecteur }
-    - Reward shaping basé sur progression vers l'objectif
-    - Action smoothing (exponential moving average)
-    - Compteur de succès / tentatives
+    - Reward shaping basé sur progression
+    - Penalités pour sortie de voie et collisions
+    - Compteurs de succès et tentatives
+    - Rendu Unreal Engine activable
     """
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
@@ -37,7 +36,6 @@ class CarlaRLEnv(gym.Env):
     ):
         super().__init__()
 
-        # --- Config ---
         self.host = host
         self.port = port
         self.town = town
@@ -54,88 +52,84 @@ class CarlaRLEnv(gym.Env):
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
 
-        # Put world in synchronous mode for RL determinism
+        # Mode synchrone
         settings = self.world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = self.fixed_delta_seconds
         self.world.apply_settings(settings)
-        self._synced = True
 
-        # Actor placeholders
-        self.actor_list = []  # only actors we spawned
+        # Actors
+        self.actor_list = []
         self.vehicle = None
         self.collision_sensor = None
         self.lane_sensor = None
         self.camera = None
 
-        # Camera raw storage (small & fast in callback)
-        self._last_image_bytes = None
-        self._last_image_timestamp = 0.0
-
-        # Frame stack buffer (channels-last)
+        # Frame stack
         self._image_stack = deque(maxlen=self.frame_stack)
         zero_img = np.zeros((self.image_h, self.image_w, 3), dtype=np.uint8)
         for _ in range(self.frame_stack):
             self._image_stack.append(zero_img.copy())
 
-        # State buffers / histories
+        self._last_image_bytes = None
+        self._last_image_timestamp = 0.0
+
+        # Historiques et compteurs
         self.collision_hist = []
         self.lane_hist = []
         self.prev_dist_to_goal = None
-        self.prev_action = np.array([0.0, 0.0], dtype=np.float32)  # throttle, steer
-
-        # Compteur succès / tentatives
+        self.prev_action = np.array([0.0, 0.0], dtype=np.float32)
         self.success_count = 0
-        self.episode_count = 0
+        self.attempt_count = 0
 
-        # Action & observation spaces
+        # Action et observation
         self.action_space = spaces.Box(
             low=np.array([0.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
-
         stacked_channels = 3 * self.frame_stack
         self.observation_space = spaces.Dict(
             {
                 "image": spaces.Box(
-                    low=0, high=255, shape=(self.image_h, self.image_w, stacked_channels), dtype=np.uint8
+                    low=0,
+                    high=255,
+                    shape=(self.image_h, self.image_w, stacked_channels),
+                    dtype=np.uint8,
                 ),
                 "state": spaces.Box(low=-np.inf, high=np.inf, shape=(4,), dtype=np.float32),
             }
         )
 
-        # Arrival target distance (meters)
-        self.arrival_distance = 50.0
+        # Distance d'arrivée
+        self.arrival_distance = 70.0  # augmenté
 
-        # Spawn fixed location (example)
+        # Spawn fixe
         mp = self.world.get_map()
         waypoint = mp.get_waypoint(carla.Location(x=230, y=180, z=0))
         self.start_transform = waypoint.transform
         self.fixed_spawn = self.start_transform.location
         self.fixed_rotation = self.start_transform.rotation
 
-        # Compute end waypoint
+        # Point d'arrivée
         start_wp = mp.get_waypoint(self.fixed_spawn)
         end_wp = start_wp.next(self.arrival_distance)[0]
         self.end_location = end_wp.transform.location
 
-        # debug draw once
-        self._draw_path_on_road(start_wp, end_wp)
+        # Debug draw
+        if self.render:
+            self._draw_path_on_road(start_wp, end_wp)
 
     # -----------------------
-    # Public API
+    # Reset
     # -----------------------
     def reset(self, *, seed=None, options=None) -> Tuple[Dict[str, Any], Dict]:
         super().reset(seed=seed)
-
-        self.episode_count += 1
+        self.attempt_count += 1
 
         self._clean_actors()
-
         self.collision_hist = []
         self.lane_hist = []
-        self._last_image_bytes = None
         self._image_stack.clear()
         zero_img = np.zeros((self.image_h, self.image_w, 3), dtype=np.uint8)
         for _ in range(self.frame_stack):
@@ -175,71 +169,83 @@ class CarlaRLEnv(gym.Env):
         self.camera.listen(self._on_cam_image)
         self.actor_list.append(self.camera)
 
-        # compute target
+        # Target
         mp = self.world.get_map()
         start_wp = mp.get_waypoint(self.fixed_spawn)
         end_wp = start_wp.next(self.arrival_distance)[0]
         self.end_location = end_wp.transform.location
 
-        # tick world for sensors
-        self.world.tick()
-        for _ in range(3):
-            self.world.tick()
-
         self.prev_dist_to_goal = self._distance(self.vehicle.get_location(), self.end_location)
 
-        obs = self._get_observation()
+        # Spectateur
         if self.render:
             self._update_spectator()
+
+        obs = self._get_observation()
         return obs, {}
 
+    # -----------------------
+    # Step
+    # -----------------------
     def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], float, bool, bool, Dict]:
         alpha = 0.3
         action = np.clip(action, self.action_space.low, self.action_space.high)
         smoothed = alpha * action + (1 - alpha) * self.prev_action
         self.prev_action = smoothed.copy()
+        throttle, steer = float(smoothed[0]), float(smoothed[1])
 
-        throttle = float(smoothed[0])
-        steer = float(smoothed[1])
+        # Penalité pour changement brusque de direction
+        steer_delta = abs(steer - getattr(self, "prev_steer", 0.0))
+        self.prev_steer = steer
+        steer_penalty = steer_delta * 0.1
+
         self.vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=0.0))
-
         self.world.tick()
+
         if self.render:
             self._update_spectator()
 
         obs = self._get_observation()
 
+        # Reward
         loc = self.vehicle.get_location()
         current_dist = self._distance(loc, self.end_location)
-        progress = (self.prev_dist_to_goal - current_dist) if self.prev_dist_to_goal is not None else 0.0
+        progress = self.prev_dist_to_goal - current_dist if self.prev_dist_to_goal is not None else 0.0
         self.prev_dist_to_goal = current_dist
 
         reward = 0.0
         reward += float(progress) * 10.0
-        reward -= 0.05
-        velocity = self.vehicle.get_velocity()
-        speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-        reward -= abs(steer) * 0.01 * (1.0 + speed)
+        reward -= 0.05  # time penalty
+        reward -= steer_penalty
 
+        # Lane violation
         if len(self.lane_hist) > 0:
-            reward -= 2.0
+            reward -= 10.0  # pénalité plus forte
             self.lane_hist = []
+            # Retour au départ
+            loc = self.fixed_spawn
+            self.vehicle.set_transform(carla.Transform(loc, self.fixed_rotation))
+            self.prev_dist_to_goal = self._distance(self.vehicle.get_location(), self.end_location)
 
+        # Collision
         terminated = False
         if len(self.collision_hist) > 0:
             reward -= 50.0
             terminated = True
 
+        # Goal
+        truncated = False
         if current_dist < 2.0:
             reward += 200.0
             terminated = True
             self.success_count += 1
 
+        # Z low
         if loc.z < -1.0:
-            reward -= 20.0
+            reward -= 15.0
             terminated = True
 
-        return obs, float(reward), bool(terminated), False, {}
+        return obs, float(reward), bool(terminated), bool(truncated), {}
 
     # -----------------------
     # Camera callback
@@ -249,37 +255,29 @@ class CarlaRLEnv(gym.Env):
         self._last_image_timestamp = image.timestamp
 
     # -----------------------
-    # Observation build
+    # Observation
     # -----------------------
     def _get_observation(self) -> Dict[str, Any]:
         if self._last_image_bytes is not None:
-            try:
-                cam_w = int(self.camera.attributes.get("image_size_x", self.image_w))
-                cam_h = int(self.camera.attributes.get("image_size_y", self.image_h))
-                arr = np.frombuffer(self._last_image_bytes, dtype=np.uint8)
-                expected = cam_w * cam_h * 4
-                if arr.size == expected:
-                    arr = arr.reshape((cam_h, cam_w, 4))
-                    img = arr[:, :, :3][:, :, ::-1]
-                else:
-                    possible_w = arr.size // (cam_h * 4)
-                    if possible_w > 0:
-                        arr = arr.reshape((cam_h, possible_w, 4))
-                        img = arr[:, :, :3][:, :, ::-1]
-                    else:
-                        img = np.zeros((self.image_h, self.image_w, 3), dtype=np.uint8)
-                img = cv2.resize(img, (self.image_w, self.image_h))
-            except Exception:
+            arr = np.frombuffer(self._last_image_bytes, dtype=np.uint8)
+            cam_w = int(self.camera.attributes.get("image_size_x", self.image_w))
+            cam_h = int(self.camera.attributes.get("image_size_y", self.image_h))
+            expected = cam_w * cam_h * 4
+            if arr.size == expected:
+                arr = arr.reshape((cam_h, cam_w, 4))
+                img = arr[:, :, :3][:, :, ::-1]
+            else:
                 img = np.zeros((self.image_h, self.image_w, 3), dtype=np.uint8)
+            img = cv2.resize(img, (self.image_w, self.image_h))
         else:
             img = np.zeros((self.image_h, self.image_w, 3), dtype=np.uint8)
 
         self._image_stack.append(img)
         stacked = np.concatenate(list(self._image_stack), axis=2).astype(np.uint8)
 
+        # State vector
         velocity = self.vehicle.get_velocity()
         speed = math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
-
         vt = self.vehicle.get_transform()
         fwd = vt.get_forward_vector()
         to_goal = carla.Location(
@@ -287,7 +285,6 @@ class CarlaRLEnv(gym.Env):
             y=self.end_location.y - vt.location.y,
             z=self.end_location.z - vt.location.z,
         )
-
         fwd_vec = np.array([fwd.x, fwd.y], dtype=np.float32)
         goal_vec = np.array([to_goal.x, to_goal.y], dtype=np.float32)
         norm_f = np.linalg.norm(fwd_vec) + 1e-8
@@ -295,10 +292,8 @@ class CarlaRLEnv(gym.Env):
         dot = float(np.dot(fwd_vec, goal_vec) / (norm_f * norm_g))
         dot = np.clip(dot, -1.0, 1.0)
         heading_error = math.acos(dot)
-
         dist_to_goal = float(self._distance(vt.location, self.end_location))
-        progress_est = float(self.prev_dist_to_goal - dist_to_goal) if self.prev_dist_to_goal else 0.0
-
+        progress_est = float(self.prev_dist_to_goal - dist_to_goal if self.prev_dist_to_goal is not None else 0.0)
         state = np.array([speed, heading_error, dist_to_goal, progress_est], dtype=np.float32)
 
         return {"image": stacked, "state": state}
@@ -309,14 +304,13 @@ class CarlaRLEnv(gym.Env):
     def _distance(self, a: carla.Location, b: carla.Location) -> float:
         return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
 
-    def _draw_marker(self, location: carla.Location, color: carla.Color):
-        self.world.debug.draw_box(
-            box=carla.BoundingBox(location, carla.Vector3D(0.5, 0.5, 0.5)),
-            rotation=carla.Rotation(),
-            color=color,
-            thickness=0.2,
-            life_time=0,
-        )
+    def _update_spectator(self):
+        spectator = self.world.get_spectator()
+        vt = self.vehicle.get_transform()
+        fwd = vt.get_forward_vector()
+        pos = vt.location - fwd * 7.0
+        pos.z += 3.0
+        spectator.set_transform(carla.Transform(pos, carla.Rotation(pitch=-10, yaw=vt.rotation.yaw)))
 
     def _draw_path_on_road(self, start_wp, end_wp):
         waypoints = [start_wp]
@@ -335,16 +329,6 @@ class CarlaRLEnv(gym.Env):
                 color=carla.Color(0, 255, 0),
                 life_time=0,
             )
-
-    def _update_spectator(self):
-        if self.vehicle is None:
-            return
-        spectator = self.world.get_spectator()
-        vt = self.vehicle.get_transform()
-        fwd = vt.get_forward_vector()
-        pos = vt.location - fwd * 7.0
-        pos.z += 3.0
-        spectator.set_transform(carla.Transform(pos, carla.Rotation(pitch=-10, yaw=vt.rotation.yaw)))
 
     def _clean_actors(self):
         for actor in self.actor_list:

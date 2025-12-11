@@ -10,14 +10,12 @@ from gym_env_carla import CarlaRLEnv
 def make_env(rank, seed=0):
     """
     Crée un environnement CARLA avec reset automatique.
-    rank : index de l'environnement
-    seed : pour reproductibilité
     """
     def _init():
         env = CarlaRLEnv(render=True)
         obs, _ = env.reset(seed=seed + rank)
         print(f"[Env {rank}] Reset done, starting training...")
-        print(f"Succès / Tentatives: {env.success_count} / {env.episode_count}")
+        print(f"Succès / Tentatives: {env.success_count} / {env.attempt_count}")
         return env
     return _init
 
