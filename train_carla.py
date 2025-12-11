@@ -10,13 +10,14 @@ from gym_env_carla import CarlaRLEnv
 def make_env(rank, seed=0):
     """
     Crée un environnement CARLA avec reset automatique.
-    rank : index de l'environnement (utile si multi-env)
-    seed : seed pour reproducibilité
+    rank : index de l'environnement
+    seed : pour reproductibilité
     """
     def _init():
-        env = CarlaRLEnv()
+        env = CarlaRLEnv(render=True)
         obs, _ = env.reset(seed=seed + rank)
         print(f"[Env {rank}] Reset done, starting training...")
+        print(f"Succès / Tentatives: {env.success_count} / {env.episode_count}")
         return env
     return _init
 
@@ -38,14 +39,13 @@ if __name__ == "__main__":
 
     final_model_path = os.path.join(base_dir, "ppo_carla_final.zip")
 
-    # Chargement ou nouveau modèle
     if os.path.exists(final_model_path):
         print("🔄 Reprise du modèle existant...")
         model = PPO.load(final_model_path, env)
     else:
-        print("🚀 Nouveau modèle PPO (CnnPolicy)")
+        print("🚀 Nouveau modèle PPO (MultiInputPolicy)")
         model = PPO(
-            policy="CnnPolicy",
+            policy="MultiInputPolicy",
             env=env,
             learning_rate=3e-4,
             n_steps=1024,
@@ -58,7 +58,6 @@ if __name__ == "__main__":
             tensorboard_log=logdir,
         )
 
-    # Sauvegardes régulières
     checkpoint_callback = CheckpointCallback(
         save_freq=5000,
         save_path=checkpoint_dir,
