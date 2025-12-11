@@ -1,3 +1,4 @@
+# train_carla.py
 import os
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
@@ -8,11 +9,9 @@ from gym_env_carla import CarlaRLEnv
 
 
 def make_env(rank, seed=0):
-    """
-    Crée un environnement CARLA avec reset automatique.
-    """
     def _init():
-        env = CarlaRLEnv(render=True)
+        # render=True updates spectator in CARLA (Unreal); show_cam=True opens local OpenCV preview
+        env = CarlaRLEnv(render=True, show_cam=True)
         obs, _ = env.reset(seed=seed + rank)
         print(f"[Env {rank}] Reset done, starting training...")
         print(f"Succès / Tentatives: {env.success_count} / {env.attempt_count}")
@@ -33,13 +32,15 @@ if __name__ == "__main__":
     print("🔹 Initialisation de l'environnement vectorisé...")
     env = DummyVecEnv([make_env(i) for i in range(NUM_ENVS)])
     env = VecMonitor(env)
+    # do not normalize image obs automatically; keep raw images; normalize rewards
     env = VecNormalize(env, norm_obs=False, norm_reward=True)
 
     final_model_path = os.path.join(base_dir, "ppo_carla_final.zip")
 
+    # load or create
     if os.path.exists(final_model_path):
         print("🔄 Reprise du modèle existant...")
-        model = PPO.load(final_model_path, env)
+        model = PPO.load(final_model_path, env=env)
     else:
         print("🚀 Nouveau modèle PPO (MultiInputPolicy)")
         model = PPO(
@@ -56,6 +57,7 @@ if __name__ == "__main__":
             tensorboard_log=logdir,
         )
 
+    # checkpoint callback
     checkpoint_callback = CheckpointCallback(
         save_freq=5000,
         save_path=checkpoint_dir,
