@@ -10,8 +10,15 @@ from gym_env_carla import CarlaRLEnv
 
 def make_env(rank, seed=0):
     def _init():
-        # render=True updates spectator in CARLA (Unreal); show_cam=True opens local OpenCV preview
-        env = CarlaRLEnv(render=True, show_cam=True)
+        # Lighter scenario for stability: fewer vehicles, no pedestrians, LiDAR disabled
+        env = CarlaRLEnv(
+            render=False,
+            show_cam=False,
+            scenario="random",
+            num_npc_vehicles=20,   # was 20
+            num_pedestrians=10,     # was 10
+            use_lidar=False,       # keep LiDAR grid interface, but no heavy sensor actor
+        )
         obs, _ = env.reset(seed=seed + rank)
         print(f"[Env {rank}] Reset done, starting training...")
         print(f"Succès / Tentatives: {env.success_count} / {env.attempt_count}")
@@ -21,7 +28,7 @@ def make_env(rank, seed=0):
 
 if __name__ == "__main__":
     NUM_ENVS = 1
-    TOTAL_TIMESTEPS = 300_000
+    TOTAL_TIMESTEPS = 300_000  # adjust as you like vs wall-clock
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     logdir = os.path.join(base_dir, "logs")
@@ -47,7 +54,7 @@ if __name__ == "__main__":
             policy="MultiInputPolicy",
             env=env,
             learning_rate=3e-4,
-            n_steps=1024,
+            n_steps=2048,
             batch_size=64,
             n_epochs=10,
             gamma=0.99,
